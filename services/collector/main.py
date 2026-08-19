@@ -1,10 +1,10 @@
 import logging
 from datetime import datetime, timezone
 
-import requests
 from pydantic import ValidationError
 
 from models import EarthquakeEvent
+from redis_client import create_redis_client, publish_earthquake
 
 
 USGS_URL = (
@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 def fetch_earthquakes():
+    import requests
+
     logger.info("Fetching earthquake data from USGS")
 
     try:
@@ -93,23 +95,27 @@ def main():
         logger.error("Collector stopped because USGS data could not be fetched")
         raise SystemExit(1)
 
-    events = []
+    redis_client = create_redis_client()
+
+    if redis_client is None:
+        logger.error("Collector stopped because Redis is unavailable")
+        raise SystemExit(1)
+
+    published_count = 0
 
     for feature in data.get("features", [])[:5]:
         event = parse_earthquake(feature)
 
-        if event is not None:
-            events.append(event)
+        if event is None:
+            continue
 
-    logger.info("Successfully parsed %d earthquake events", len(events))
+        if publish_earthquake(redis_client, event):
+            published_count += 1
 
-    for event in events:
-        logger.info(
-            "Earthquake | id=%s | magnitude=%s | place=%s",
-            event.event_id,
-            event.magnitude,
-            event.place,
-        )
+    logger.info(
+        "Collector completed | events_published=%d",
+        published_count,
+    )
 
 
 if __name__ == "__main__":
