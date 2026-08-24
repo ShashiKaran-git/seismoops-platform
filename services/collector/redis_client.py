@@ -3,14 +3,14 @@ import logging
 
 import redis
 
-from models import EarthquakeEvent
+from services.models import EarthquakeEvent
 
 
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
 REDIS_DB = 0
 
-EARTHQUAKE_QUEUE = "seismoops:earthquakes"
+EARTHQUAKE_STREAM = "seismoops:earthquake-stream"
 PROCESSED_EVENTS = "seismoops:processed_events"
 
 
@@ -36,29 +36,36 @@ def create_redis_client():
 
 
 def publish_earthquake(client, event: EarthquakeEvent):
-    event_data = json.dumps(
-        event.model_dump(mode="json")
-    )
+    event_data = event.model_dump(mode="json")
 
     script = """
     if redis.call("SISMEMBER", KEYS[2], ARGV[1]) == 1 then
         return 0
     end
 
-    redis.call("RPUSH", KEYS[1], ARGV[2])
+    local stream_id = redis.call(
+        "XADD",
+        KEYS[1],
+        "*",
+        "event_id",
+        ARGV[1],
+        "event_data",
+        ARGV[2]
+    )
+
     redis.call("SADD", KEYS[2], ARGV[1])
 
-    return 1
+    return stream_id
     """
 
     try:
         result = client.eval(
             script,
             2,
-            EARTHQUAKE_QUEUE,
+            EARTHQUAKE_STREAM,
             PROCESSED_EVENTS,
             event.event_id,
-            event_data,
+            json.dumps(event_data),
         )
 
         if result == 0:
@@ -69,8 +76,9 @@ def publish_earthquake(client, event: EarthquakeEvent):
             return False
 
         logger.info(
-            "Published new earthquake event to Redis | event_id=%s",
+            "Published earthquake event to Redis Stream | event_id=%s | stream_id=%s",
             event.event_id,
+            result,
         )
 
         return True

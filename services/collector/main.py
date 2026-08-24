@@ -1,10 +1,14 @@
 import logging
 from datetime import datetime, timezone
 
+import requests
 from pydantic import ValidationError
 
-from models import EarthquakeEvent
-from redis_client import create_redis_client, publish_earthquake
+from services.models import EarthquakeEvent
+from services.collector.redis_client import (
+    create_redis_client,
+    publish_earthquake,
+)
 
 
 USGS_URL = (
@@ -21,8 +25,6 @@ logger = logging.getLogger(__name__)
 
 
 def fetch_earthquakes():
-    import requests
-
     logger.info("Fetching earthquake data from USGS")
 
     try:
