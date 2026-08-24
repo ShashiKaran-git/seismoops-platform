@@ -1,1 +1,1 @@
-# seismoops-platform
+# Seismoops-platform
