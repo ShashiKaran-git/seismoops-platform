@@ -15,6 +15,9 @@ EARTHQUAKE_STREAM = "seismoops:earthquake-stream"
 CONSUMER_GROUP = "seismoops-processors"
 CONSUMER_NAME = "seismoops-processor-1"
 
+RECOVERY_IDLE_TIME_MS = 30_000
+RECOVERY_BATCH_SIZE = 10
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,7 +49,117 @@ def create_redis_client():
         return None
 
 
-def consume_earthquake(client):
+def process_message(client, message_id, fields):
+    try:
+        event_data = fields.get("event_data")
+
+        if event_data is None:
+            logger.error(
+                "Missing event_data field | stream_id=%s",
+                message_id,
+            )
+            return False
+
+        data = json.loads(event_data)
+
+        event = EarthquakeEvent.model_validate(data)
+
+        logger.info(
+            "Processed earthquake event | "
+            "stream_id=%s | event_id=%s | magnitude=%s | place=%s",
+            message_id,
+            event.event_id,
+            event.magnitude,
+            event.place,
+        )
+
+        client.xack(
+            EARTHQUAKE_STREAM,
+            CONSUMER_GROUP,
+            message_id,
+        )
+
+        logger.info(
+            "Acknowledged earthquake event | "
+            "stream_id=%s | event_id=%s",
+            message_id,
+            event.event_id,
+        )
+
+        return True
+
+    except json.JSONDecodeError as error:
+        logger.error(
+            "Invalid JSON in stream message | "
+            "stream_id=%s | error=%s",
+            message_id,
+            error,
+        )
+        return False
+
+    except ValidationError as error:
+        logger.error(
+            "Earthquake validation failed during processing | "
+            "stream_id=%s | errors=%s",
+            message_id,
+            error.errors(),
+        )
+        return False
+
+    except redis.RedisError as error:
+        logger.error(
+            "Redis error while processing message | "
+            "stream_id=%s | error=%s",
+            message_id,
+            error,
+        )
+        return False
+
+
+def recover_pending_messages(client):
+    try:
+        result = client.xautoclaim(
+            name=EARTHQUAKE_STREAM,
+            groupname=CONSUMER_GROUP,
+            consumername=CONSUMER_NAME,
+            min_idle_time=RECOVERY_IDLE_TIME_MS,
+            start_id="0-0",
+            count=RECOVERY_BATCH_SIZE,
+        )
+
+        next_start_id, messages, deleted_ids = result
+
+        if not messages:
+            return 0
+
+        recovered_count = 0
+
+        for message_id, fields in messages:
+            logger.info(
+                "Recovered pending earthquake event | "
+                "stream_id=%s",
+                message_id,
+            )
+
+            if process_message(client, message_id, fields):
+                recovered_count += 1
+
+        logger.info(
+            "Pending message recovery completed | recovered=%s",
+            recovered_count,
+        )
+
+        return recovered_count
+
+    except redis.RedisError as error:
+        logger.error(
+            "Failed to recover pending messages | error=%s",
+            error,
+        )
+        return 0
+
+
+def consume_new_messages(client):
     try:
         messages = client.xreadgroup(
             groupname=CONSUMER_GROUP,
@@ -59,71 +172,24 @@ def consume_earthquake(client):
         )
 
         if not messages:
-            return False
+            return 0
+
+        processed_count = 0
 
         for stream_name, stream_messages in messages:
             for message_id, fields in stream_messages:
 
-                try:
-                    event_data = fields.get("event_data")
+                if process_message(client, message_id, fields):
+                    processed_count += 1
 
-                    if event_data is None:
-                        logger.error(
-                            "Missing event_data field | stream_id=%s",
-                            message_id,
-                        )
-                        continue
-
-                    data = json.loads(event_data)
-
-                    event = EarthquakeEvent.model_validate(data)
-
-                    logger.info(
-                        "Consumed earthquake event | "
-                        "stream_id=%s | event_id=%s | magnitude=%s | place=%s",
-                        message_id,
-                        event.event_id,
-                        event.magnitude,
-                        event.place,
-                    )
-
-                    client.xack(
-                        EARTHQUAKE_STREAM,
-                        CONSUMER_GROUP,
-                        message_id,
-                    )
-
-                    logger.info(
-                        "Acknowledged earthquake event | "
-                        "stream_id=%s | event_id=%s",
-                        message_id,
-                        event.event_id,
-                    )
-
-                except json.JSONDecodeError as error:
-                    logger.error(
-                        "Invalid JSON in stream message | "
-                        "stream_id=%s | error=%s",
-                        message_id,
-                        error,
-                    )
-
-                except ValidationError as error:
-                    logger.error(
-                        "Earthquake validation failed during processing | "
-                        "stream_id=%s | errors=%s",
-                        message_id,
-                        error.errors(),
-                    )
-
-        return True
+        return processed_count
 
     except redis.RedisError as error:
         logger.error(
             "Failed to consume earthquake stream | error=%s",
             error,
         )
-        return False
+        return 0
 
 
 def main():
@@ -142,7 +208,8 @@ def main():
 
     try:
         while True:
-            consume_earthquake(redis_client)
+            recover_pending_messages(redis_client)
+            consume_new_messages(redis_client)
 
     except KeyboardInterrupt:
         logger.info("Processor shutdown requested")
