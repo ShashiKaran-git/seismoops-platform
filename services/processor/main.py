@@ -30,6 +30,7 @@ def create_redis_client():
         port=REDIS_PORT,
         db=REDIS_DB,
         decode_responses=True,
+        socket_timeout=None,
     )
 
     try:
@@ -38,7 +39,10 @@ def create_redis_client():
         return client
 
     except redis.RedisError as error:
-        logger.error("Redis connection failed | error=%s", error)
+        logger.error(
+            "Redis connection failed | error=%s",
+            error,
+        )
         return None
 
 
@@ -51,11 +55,11 @@ def consume_earthquake(client):
                 EARTHQUAKE_STREAM: ">"
             },
             count=1,
-            block=1000,
+            block=5000,
         )
 
         if not messages:
-            return None
+            return False
 
         for stream_name, stream_messages in messages:
             for message_id, fields in stream_messages:
@@ -68,7 +72,7 @@ def consume_earthquake(client):
                             "Missing event_data field | stream_id=%s",
                             message_id,
                         )
-                        return None
+                        continue
 
                     data = json.loads(event_data)
 
@@ -96,8 +100,6 @@ def consume_earthquake(client):
                         event.event_id,
                     )
 
-                    return event
-
                 except json.JSONDecodeError as error:
                     logger.error(
                         "Invalid JSON in stream message | "
@@ -105,7 +107,6 @@ def consume_earthquake(client):
                         message_id,
                         error,
                     )
-                    return None
 
                 except ValidationError as error:
                     logger.error(
@@ -114,16 +115,15 @@ def consume_earthquake(client):
                         message_id,
                         error.errors(),
                     )
-                    return None
 
-        return None
+        return True
 
     except redis.RedisError as error:
         logger.error(
             "Failed to consume earthquake stream | error=%s",
             error,
         )
-        return None
+        return False
 
 
 def main():
@@ -132,16 +132,24 @@ def main():
     if redis_client is None:
         raise SystemExit(1)
 
-    event = consume_earthquake(redis_client)
-
-    if event is None:
-        logger.info("No new earthquake events available")
-        return
-
     logger.info(
-        "Processor successfully handled event | event_id=%s",
-        event.event_id,
+        "Starting earthquake processor | "
+        "stream=%s | group=%s | consumer=%s",
+        EARTHQUAKE_STREAM,
+        CONSUMER_GROUP,
+        CONSUMER_NAME,
     )
+
+    try:
+        while True:
+            consume_earthquake(redis_client)
+
+    except KeyboardInterrupt:
+        logger.info("Processor shutdown requested")
+
+    finally:
+        redis_client.close()
+        logger.info("Processor stopped")
 
 
 if __name__ == "__main__":
