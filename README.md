@@ -1,59 +1,23 @@
 # SeismoOps Platform
 
-Event-driven earthquake monitoring and processing platform built on Redis Streams, with a roadmap toward persistence, AI-based earthquake intelligence, and cloud-native deployment.
+An event-driven earthquake ingestion and processing platform built on Redis Streams. It ingests earthquake data from the USGS earthquake feed, validates it, and processes it through a Redis Consumer Group with automatic recovery of unacknowledged messages, bounded retries, and a dead-letter queue for events that fail repeatedly.
 
 ## Overview
 
-SeismoOps ingests USGS earthquake data from a frequently updated GeoJSON feed, validates and normalizes each event, guarantees idempotent ingestion, and publishes valid events onto a Redis Stream for reliable, acknowledgement-based processing via Redis Consumer Groups.
+The point of this project is not "fetch earthquake data from an API." It's the reliability engineering built around that ingestion: validation before anything is trusted, idempotent publishing, durable event storage, consumer-group-based delivery tracking, recovery of messages left unacknowledged by a failed consumer, bounded retries, and isolation of events that keep failing.
 
-The project is being built incrementally rather than as a single API-to-database script. Each stage was added deliberately to demonstrate a specific engineering concern — data validation, deduplication, at-least-once delivery, and consumer-group-based processing — before moving on to persistence, AI analysis, observability, and cloud deployment.
+Two components make up the system:
 
-## Why This Project Exists
+- **Collector** (`services/collector/`) — a one-shot script that fetches the USGS GeoJSON feed, validates each event, and publishes new (non-duplicate) events to a Redis Stream.
+- **Processor** (`services/processor/`) — a long-running service that consumes from that stream through a Redis Consumer Group, validates and processes each event, acknowledges successful ones, reclaims stale pending messages, retries failures a bounded number of times, and routes repeatedly failing events to a dead-letter stream.
 
-It's easy to build a script that calls an API and prints the response. SeismoOps is intentionally scoped around the harder, more transferable problems in data platform engineering:
-
-- **Validation** — rejecting malformed upstream data before it enters the system
-- **Idempotency** — safely handling a feed that may redeliver the same event
-- **Event-driven processing** — decoupling ingestion from processing via a durable stream
-- **Reliable delivery** — explicit acknowledgement instead of "fire and forget" consumption
-- **Incremental architecture** — evolving the design as new failure modes are discovered, rather than over-engineering upfront
-
-The USGS API call is the least interesting part of this project. What happens after the data arrives is the point.
+The system was built incrementally — ingestion first, then idempotency, then a migration from simpler processing to Redis Streams and Consumer Groups, then a long-running processor, then pending-message recovery, then bounded retries and a dead-letter queue — with each stage closing a specific reliability gap left by the one before it.
 
 ## Architecture
 
-```
-USGS Earthquake GeoJSON Feed
-        │
-        ▼
-  Collector Service
-        │
-        ▼
- Pydantic Validation
-        │
-        ▼
-Idempotent Event Check  ──duplicate──▶ (skipped)
-        │
-        ▼
-   Redis Stream
- (seismoops:earthquake-stream)
-        │
-        ▼
- Redis Consumer Group
- (seismoops-processors)
-        │
-        ▼
-  Processor Service
-        │
-        ▼
-       XACK
-```
-
-### Diagram (Mermaid)
-
 ```mermaid
 flowchart TD
-    A[USGS GeoJSON Feed] --> B[Collector Service]
+    A[USGS Earthquake GeoJSON Feed] --> B[Collector]
     B --> C[Pydantic Validation]
     C -->|invalid| X[Rejected + Logged]
     C -->|valid| D[Idempotency Check<br/>seismoops:processed_events]
@@ -61,114 +25,110 @@ flowchart TD
     D -->|new| E[Redis Stream<br/>seismoops:earthquake-stream]
     E --> F[Consumer Group<br/>seismoops-processors]
     F --> G[Processor<br/>seismoops-processor-1]
-    G --> H[XACK]
+    G --> H{Success?}
+    H -->|yes| I[XACK]
+    H -->|no| J[increment retry key<br/>seismoops:retry:msg_id]
+    J --> K{retry_count = 3?}
+    K -->|no| L[stays pending in PEL]
+    L -.->|XAUTOCLAIM, idle >= 30s| G
+    K -->|yes| M[XADD to seismoops:earthquake-dlq]
+    M --> N[XACK original message]
+    N --> O[delete retry key]
 ```
 
-## Current Features (Implemented)
+The main data path is USGS → Collector → validation → idempotency check → Redis Stream → Consumer Group → Processor → validation → acknowledgement. Running alongside it is the reliability path: a message that isn't acknowledged stays in the consumer group's Pending Entries List, gets reclaimed by `XAUTOCLAIM` once idle long enough, and is retried until it succeeds or exhausts its retry budget and is written to the dead-letter stream.
 
-| Feature | Status | Notes |
-|---|---|---|
-| USGS earthquake collection | ✅ Implemented | Polls the USGS GeoJSON feed; extracts event ID, magnitude, place, lat/lon, depth, timestamp, source |
-| Pydantic validation | ✅ Implemented | Invalid events rejected and logged — verified against a real malformed USGS record (negative depth) |
-| Idempotent ingestion | ✅ Implemented | Redis key `seismoops:processed_events` tracks seen event IDs; duplicates are skipped, not re-published |
-| Redis integration | ✅ Implemented | Redis 7.4.8, running in Docker (`seismoops-redis`, `localhost:6379`) |
-| Redis Streams | ✅ Implemented | Migrated from an earlier Redis List design to `seismoops:earthquake-stream` |
-| Redis Consumer Groups | ✅ Implemented | Group `seismoops-processors`, consumer `seismoops-processor-1`, via `XREADGROUP` |
-| Acknowledgement-based processing | ✅ Implemented | Processor acknowledges successfully handled events with `XACK` |
-| Dockerized infrastructure | ✅ Implemented | Redis currently runs as a Docker container as the local infra layer |
+## Why Redis Streams
 
-## Reliability Design
+A Redis List or Pub/Sub channel doesn't provide the consumer-group delivery tracking this project needs — once an item is popped or published, there's no record of whether it was actually handled. Redis Streams provide two things this project depends on directly:
 
-The processor follows an explicit read → process → acknowledge sequence:
+- **Presistent, ordered entries.** Events are appended via `XADD` to `seismoops:earthquake-stream` and retained there regardless of consumption state — acknowledgement never deletes the entry.
+- **Consumer-group delivery tracking.** The `seismoops-processors` group tracks, per consumer, which messages have been delivered but not yet acknowledged. That tracked state (the PEL) is what makes recovery, retries, and the DLQ possible at all.
+
+## Event Processing Flow
+
+1. The collector fetches the USGS feed and validates each candidate event against the shared `EarthquakeEvent` Pydantic model (`services/models.py`). Invalid events (bad coordinates, out-of-range depth, missing fields) are logged and dropped before they ever reach Redis.
+2. For each valid event, a Lua script (`services/collector/redis_client.py`) atomically checks `seismoops:processed_events` and, if the event ID hasn't been published before, appends it to `seismoops:earthquake-stream` via `XADD` and records it in the set — in a single Redis round trip, so there's no race between checking and publishing.
+3. The processor reads from the stream as consumer `seismoops-processor-1` in group `seismoops-processors`, using `XREADGROUP`.
+4. Each message is re-validated against `EarthquakeEvent`, and on success acknowledged with `XACK`.
+
+## Reliability and Failure Recovery
+
+**Acknowledgement.** A message is only acknowledged with `XACK` after `process_message` has successfully validated and handled it — not on receipt. This is what makes the rest of the reliability model possible: if a crash happens between reading and finishing processing, the message is still recoverable.
+
+**Pending Entries List.** Once a consumer reads a message via `XREADGROUP` but hasn't yet acknowledged it, Redis tracks that message as pending for the consumer group. It stays there until acknowledged or reclaimed.
+
+**Recovery.** Before reading new messages on each loop iteration, the processor calls `XAUTOCLAIM` to reclaim messages that have been pending for at least the configured idle time:
 
 ```
-XREADGROUP  →  validate/process event  →  XACK
+RECOVERY_IDLE_TIME_MS = 30_000   # 30 seconds
+RECOVERY_BATCH_SIZE = 10
 ```
 
-It's worth being precise about what each piece actually does, since these terms are often conflated:
+In plain terms: if a message has been sitting unacknowledged for 30 seconds or longer — because the consumer that read it crashed, hung, or was killed — the processor picks it back up and tries it again, up to 10 at a time. This runs continuously as part of the processor's main loop, not as a separate cleanup job.
 
-- **Redis Stream** — retains the event entry. Entries are not deleted by acknowledgement.
-- **Consumer Group** — tracks per-consumer delivery and acknowledgement state for the stream.
-- **XACK** — removes the message from the consumer group's Pending Entries List (PEL). It does **not** delete the entry from the stream itself.
+**Retry.** Each processing failure — a validation error, a JSON decode error, a Redis error — increments a retry counter stored at `seismoops:retry:<stream_id>`, with a 24-hour expiration refreshed on each increment. `MAX_RETRIES = 3`. A message that fails is not immediately given up on; it stays pending and gets a fresh attempt the next time `XAUTOCLAIM` reclaims it.
 
-This distinction matters for reliability: if a consumer crashes after `XREADGROUP` but before `XACK`, the message remains in the PEL rather than being silently lost, which is the foundation for retry/recovery handling (planned — see [Roadmap](#roadmap)). Automatic retry logic is not implemented yet; today, a failed message stays pending and requires manual inspection via `XPENDING`.
+**Dead Letter Queue.** Once the retry counter reaches 3, the message is written to `seismoops:earthquake-dlq` — a Redis Stream used as a dead-letter queue, not a separate messaging system. The DLQ entry copies the original event fields and adds `original_stream_id` and `retry_count`. The original message is then `XACK`ed against `seismoops:earthquake-stream`, so it's removed from the PEL and won't be reclaimed again, and the retry key is deleted. This keeps events that fail deterministically (a malformed event will fail identically every time) from occupying the pending path indefinitely, while preserving the failed event and its retry history for manual inspection.
 
-To verify correct behavior, Redis Consumer Group state was inspected directly:
+## Idempotency
 
-- **`XLEN`** — total number of entries currently in the stream
-- **`XPENDING`** — messages delivered to the consumer group but not yet acknowledged
-- **Consumer group lag** — messages in the stream not yet delivered to the group
-
-Using these, it was confirmed that messages are delivered, processed, and acknowledged correctly, with `XPENDING` returning to empty after successful processing.
-
-## Technology Stack
-
-**Currently used:**
-
-- Python
-- `requests`
-- Pydantic
-- Redis (Streams + Consumer Groups)
-- Docker
-- Git / GitHub
-
-**Planned, not yet implemented:** PostgreSQL, an AI analysis service, Prometheus, Grafana, Kubernetes, CI/CD, Terraform, AWS. These are not currently part of the running system — see [Roadmap](#roadmap).
+Idempotency is enforced at publish time. The Lua script in `services/collector/redis_client.py` checks `SISMEMBER seismoops:processed_events <event_id>` and, only if absent, performs the `XADD` and `SADD` together atomically. This protects against re-publishing the same USGS event if the collector is run again and the feed still returns it — it does not, and is not meant to, prevent the processor from re-processing a message that's legitimately reclaimed via `XAUTOCLAIM`.
 
 ## Project Structure
 
 ```
 seismoops-platform/
-│
 ├── services/
 │   ├── __init__.py
-│   ├── models.py
+│   ├── models.py                # shared EarthquakeEvent model — imported by collector and processor
 │   │
 │   ├── collector/
 │   │   ├── __init__.py
-│   │   ├── main.py
-│   │   ├── redis_client.py
-│   │   └── test_publisher.py
+│   │   ├── main.py              # fetch USGS feed, validate, publish (one-shot)
+│   │   ├── models.py            # earlier copy of EarthquakeEvent — not imported anywhere, unused
+│   │   ├── redis_client.py      # Redis connection + Lua-script-based idempotent publish
+│   │   └── test_publisher.py    # manual publish test
 │   │
 │   └── processor/
 │       ├── __init__.py
-│       └── main.py
+│       ├── main.py              # long-running consumer: recovery, consumption, retry, DLQ
+│       └── test_failure.py      # deliberately fails before XACK, to exercise recovery
 │
 ├── .gitignore
 ├── README.md
 └── requirements.txt
 ```
 
-`services/models.py` contains the shared `EarthquakeEvent` model used by both the collector and the processor. Some legacy files from earlier development stages may still exist in the repository and are scheduled for cleanup.
+There is no `service/` (singular) directory in the current repository — only `services/`. `services/collector/models.py` duplicates `EarthquakeEvent` with a stricter depth constraint (`depth_km >= 0`) but is not imported by `services/collector/main.py`, which uses `services/models.py` instead (allowing the wider `-100` to `1000` km range documented in the USGS catalog); it appears to be left over from an earlier stage. There is no Dockerfile, `docker-compose.yml`, CI configuration, or license file in the repository.
 
-## How the System Works
+## Technology Stack
 
-1. The **collector** polls the USGS earthquake GeoJSON feed and parses incoming events.
-2. Each event is validated against the shared `EarthquakeEvent` Pydantic model (`services/models.py`); invalid events are logged and dropped.
-3. The collector checks the event ID against `seismoops:processed_events` in Redis to avoid re-publishing duplicates.
-4. Valid, new events are published to the `seismoops:earthquake-stream` Redis Stream.
-5. The **processor** reads from the stream via the `seismoops-processors` consumer group using `XREADGROUP`.
-6. After successful processing, the processor sends `XACK`, removing the message from the group's pending entries (the stream entry itself is retained).
+**Implemented / current:**
 
-The processor currently consumes one available event per execution and exits — it is not yet a long-running worker. Continuous processing is a planned Phase 3 item (see [Roadmap](#roadmap)).
+- Python
+- `requests`
+- Pydantic (`2.13.4`)
+- Redis `7.4.8`, Redis Streams, Redis Consumer Groups (`redis-py` `8.1.0`)
+- Docker (used to run Redis locally; the application code itself is not containerized)
+- Git / GitHub
 
-## Local Setup
+**Planned, not implemented:** PostgreSQL persistence, an AI earthquake-intelligence service, Prometheus/Grafana observability, Kubernetes, CI/CD, Terraform, AWS deployment. None of these exist in the repository today.
+
+## Local Development
 
 ### Prerequisites
 
 - Python 3.10+
 - Docker
 
-### Running Redis
-
-If the container already exists (typical day-to-day workflow):
+### Install dependencies
 
 ```bash
-docker start seismoops-redis
-docker exec -it seismoops-redis redis-cli ping
-# Expected: PONG
+pip install -r requirements.txt
 ```
 
-If setting up a fresh environment (no existing container):
+### Start Redis
 
 ```bash
 docker run -d \
@@ -177,162 +137,126 @@ docker run -d \
   redis:7.4.8
 ```
 
-Use `docker run` only to create the container the first time; use `docker start` to bring up the existing container afterward.
-
-### Install dependencies
+On later runs, start the existing container instead of recreating it:
 
 ```bash
-pip install -r requirements.txt
+docker start seismoops-redis
+docker exec -it seismoops-redis redis-cli ping   # expect PONG
 ```
 
-### Running the collector
+Both services connect to `localhost:6379`, db `0`.
+
+### Run the collector
 
 ```bash
 python -m services.collector.main
 ```
 
-### Running the processor
+Fetches the USGS feed, validates the first 5 features returned, and publishes any not already recorded in `seismoops:processed_events`. This is a single run — it does not poll continuously.
+
+### Run the processor
 
 ```bash
 python -m services.processor.main
 ```
 
-This consumes one available event from the stream and exits.
+Runs continuously. On each loop iteration it first reclaims pending messages idle for 30+ seconds via `XAUTOCLAIM`, then waits for new messages via `XREADGROUP` (blocking up to 5 seconds). Stop it with `Ctrl+C`.
 
-## Redis Debugging Commands
-
-Commands run against the Dockerized Redis instance:
+### Useful Redis commands
 
 ```bash
-# Check stream length (total entries in the stream)
+# Total entries currently in the stream
 docker exec seismoops-redis redis-cli XLEN seismoops:earthquake-stream
 
-# Inspect consumer group state
+# Consumer group state
 docker exec seismoops-redis redis-cli XINFO GROUPS seismoops:earthquake-stream
 
-# Inspect pending (delivered but unacknowledged) messages
+# Messages delivered but not yet acknowledged
 docker exec seismoops-redis redis-cli XPENDING seismoops:earthquake-stream seismoops-processors
 
-# View recent stream entries
+# Recent stream entries
 docker exec seismoops-redis redis-cli XRANGE seismoops:earthquake-stream - + COUNT 5
 
-# Check the idempotency set
-docker exec seismoops-redis redis-cli SMEMBERS seismoops:processed_events
+# Dead-letter queue size and contents
+docker exec seismoops-redis redis-cli XLEN seismoops:earthquake-dlq
+docker exec seismoops-redis redis-cli XRANGE seismoops:earthquake-dlq - +
 
-# Basic connectivity check
-docker exec -it seismoops-redis redis-cli ping
+# Retry / idempotency keys
+docker exec seismoops-redis redis-cli KEYS "seismoops:retry:*"
+docker exec seismoops-redis redis-cli SMEMBERS seismoops:processed_events
 ```
 
 ## Testing / Verification
 
-The following behaviors have been manually verified against a running local instance:
+The following has been manually verified against a running local instance:
 
-- USGS data ingestion from the live feed
-- Pydantic validation, including rejection of a real malformed record (negative depth)
-- Idempotent duplicate prevention
-- Redis Streams publishing
-- Redis Consumer Group delivery via `XREADGROUP`
-- Acknowledgement via `XACK`
-- `XPENDING` returning to empty after successful acknowledgement
-- Consumer group state inspection via `XINFO GROUPS`
-- Redis running correctly in Docker
+- USGS ingestion from the live feed
+- Pydantic validation, including rejection of malformed events
+- Idempotent duplicate prevention via the Lua-script publish path
+- Redis Streams publishing (`XADD`) and consumer group delivery (`XREADGROUP`)
+- Successful acknowledgement (`XACK`)
+- Pending-message creation: a deliberately invalid event was published, consumed via `services/processor/test_failure.py` (which reads a message under a separate consumer name and raises before acknowledging it), and `XPENDING` confirmed the message entered the group's PEL
+- Pending-message recovery: the normal processor, once started, reclaimed the pending message via `XAUTOCLAIM`
+- Retry counting: because the test event was invalid, processing failed on each attempt, and the retry counter was observed progressing `retry=1/3`, `retry=2/3`, `retry=3/3`
+- DLQ transfer: after the third failure, the event was written to `seismoops:earthquake-dlq`, and the original stream message was acknowledged, removing it from the PEL
 
-Verification is currently manual. Automated test coverage has not been added yet — see [Roadmap](#roadmap).
-
-## AI Roadmap (Planned)
-
-No AI functionality is implemented yet. The goal is not to bolt on a chatbot, but to add genuinely useful earthquake intelligence on top of the existing event-processing pipeline:
-
-- Earthquake severity classification
-- Natural-language event summaries
-- Impact / risk analysis
-- Anomaly detection across events
-- Intelligent, threshold-based alerting
-
-**Planned future architecture:**
-
-```mermaid
-flowchart LR
-    A[USGS] --> B[Collector]
-    B --> C[Redis Stream]
-    C --> D[Processor]
-    D --> E[(PostgreSQL)]
-    D --> F[AI Analysis Service]
-    F --> G[AI-Generated Insights]
-    G --> H[Alerts / API]
-```
-
-## DevOps Roadmap (Planned)
-
-```mermaid
-flowchart TB
-    A[GitHub] --> B[CI/CD]
-    B --> C[Docker]
-    C --> D[Kubernetes]
-    D --> E[Monitoring]
-    E --> F[Prometheus]
-    E --> G[Grafana]
-```
-
-Target future data path:
-
-```
-USGS → Collector → Redis Streams → Consumer Group → Processor Workers
-     → PostgreSQL → AI Analysis Service → API / Dashboard → Users
-```
-
-Given development is happening on limited AWS free-tier credits, the cloud architecture is intentionally being kept lightweight — self-managed containers and a small number of managed services rather than a wide footprint of AWS-managed offerings, at least during the free-credit phase.
-
-## Project Status
-
-Actively in development. The ingestion and event-processing core — collector, validation, idempotency, Redis Streams, consumer group, and acknowledgement — is implemented and manually verified. The processor currently runs as a single-execution consumer rather than a continuous worker. Persistence, AI analysis, observability, and cloud/Kubernetes deployment are planned but not yet built.
+This is manual reliability testing, exercised through `services/processor/test_failure.py` and direct Redis inspection — there is no automated test suite in the repository. It confirms the recovery → retry → DLQ path works as implemented under a single processor instance; it does not establish behavior under concurrent processors, sustained load, or Redis restarts.
 
 ## Roadmap
 
-**Phase 1 — Data Ingestion**
+**Phase 1 — Data Ingestion** ✅
 - [x] USGS earthquake collector
 - [x] Pydantic validation
 - [x] Structured logging
 
-**Phase 2 — Event Infrastructure**
+**Phase 2 — Event Infrastructure** ✅
 - [x] Redis integration
 - [x] Idempotent ingestion
 - [x] Redis Streams
 - [x] Consumer Groups
 - [x] XACK acknowledgement
 
-**Phase 3 — Reliable Processing**
-- [ ] Continuous processor worker
-- [ ] Retry / recovery handling
-- [ ] Dead-letter handling
-- [ ] Improved failure handling
+**Phase 3 — Reliable Processing** ✅
+- [x] Continuous processor worker
+- [x] Pending-message recovery (`XAUTOCLAIM`)
+- [x] Bounded retry handling
+- [x] Dead-letter queue
 
-**Phase 4 — Persistence**
+**Phase 4 — Persistence** (planned)
 - [ ] PostgreSQL integration
-- [ ] Earthquake database schema
-- [ ] Historical storage
+- [ ] Historical earthquake storage
 - [ ] Query API
 
-**Phase 5 — AI Intelligence**
+**Phase 5 — AI Intelligence** (planned)
 - [ ] AI analysis service
 - [ ] Severity classification
-- [ ] Event summarization
-- [ ] Risk analysis
-- [ ] Intelligent alerts
+- [ ] Event summarization / risk analysis
+- [ ] Intelligent alerting
 
-**Phase 6 — Observability**
-- [ ] Prometheus
-- [ ] Grafana
-- [ ] Metrics
-- [ ] Dashboards
+**Phase 6 — Observability** (planned)
+- [ ] Prometheus / Grafana
+- [ ] Metrics and dashboards
 - [ ] Alerting
 
-**Phase 7 — Cloud / DevOps**
-- [ ] Docker Compose
+**Phase 7 — Cloud / DevOps** (planned)
+- [ ] Docker Compose / containerized services
 - [ ] Kubernetes
-- [ ] Horizontal processor scaling
 - [ ] CI/CD
 - [ ] Cost-conscious AWS deployment
+
+## Current Limitations
+
+- The collector is not scheduled — it's a one-shot script with no built-in polling loop or cron integration.
+- The collector processes only the first 5 features returned per run, a fixed cap in the current code.
+- No persistence beyond Redis — a successfully processed event isn't stored anywhere after acknowledgement.
+- The DLQ has no consumer — failed events accumulate in `seismoops:earthquake-dlq` with nothing currently reading, alerting on, or replaying them.
+- Only Redis is containerized; the collector and processor run as local Python processes with hardcoded connection settings.
+- `CONSUMER_NAME = "seismoops-processor-1"` is hardcoded, so running two processor instances at once would have both claim the same consumer identity rather than scaling out independently.
+- No automated tests — `test_publisher.py` and `test_failure.py` are manual verification scripts.
+
+## License
+
+No license file is present in the repository.
 
 ## Author
 
