@@ -18,6 +18,10 @@ CONSUMER_NAME = "seismoops-processor-1"
 RECOVERY_IDLE_TIME_MS = 30_000
 RECOVERY_BATCH_SIZE = 10
 
+MAX_RETRIES = 3
+RETRY_KEY_PREFIX = "seismoops:retry:"
+DEAD_LETTER_STREAM = "seismoops:earthquake-dlq"
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +52,74 @@ def create_redis_client():
         )
         return None
 
+def increment_retry_count(client, message_id):
+    retry_key = f"{RETRY_KEY_PREFIX}{message_id}"
+
+    try:
+        retry_count = client.incr(retry_key)
+
+        client.expire(
+            retry_key,
+            86_400,
+        )
+
+        logger.warning(
+            "Incremented retry count | stream_id=%s | retry=%s/%s",
+            message_id,
+            retry_count,
+            MAX_RETRIES,
+        )
+
+        return retry_count
+
+    except redis.RedisError as error:
+        logger.error(
+            "Failed to update retry count | "
+            "stream_id=%s | error=%s",
+            message_id,
+            error,
+        )
+        return None
+
+def move_to_dead_letter_queue(client, message_id, fields, retry_count):
+    try:
+        dlq_fields = dict(fields)
+
+        dlq_fields["original_stream_id"] = message_id
+        dlq_fields["retry_count"] = str(retry_count)
+
+        client.xadd(
+            DEAD_LETTER_STREAM,
+            dlq_fields,
+        )
+
+        client.xack(
+            EARTHQUAKE_STREAM,
+            CONSUMER_GROUP,
+            message_id,
+        )
+
+        client.delete(
+            f"{RETRY_KEY_PREFIX}{message_id}"
+        )
+
+        logger.error(
+            "Moved earthquake event to dead-letter queue | "
+            "stream_id=%s | retries=%s",
+            message_id,
+            retry_count,
+        )
+
+        return True
+
+    except redis.RedisError as error:
+        logger.error(
+            "Failed to move event to dead-letter queue | "
+            "stream_id=%s | error=%s",
+            message_id,
+            error,
+        )
+        return False
 
 def process_message(client, message_id, fields):
     try:
@@ -58,7 +130,7 @@ def process_message(client, message_id, fields):
                 "Missing event_data field | stream_id=%s",
                 message_id,
             )
-            return False
+            raise ValueError("Missing event_data field")
 
         data = json.loads(event_data)
 
@@ -88,22 +160,27 @@ def process_message(client, message_id, fields):
 
         return True
 
-    except json.JSONDecodeError as error:
+    except (json.JSONDecodeError, ValidationError, ValueError) as error:
         logger.error(
-            "Invalid JSON in stream message | "
+            "Message processing failed | "
             "stream_id=%s | error=%s",
             message_id,
             error,
         )
-        return False
 
-    except ValidationError as error:
-        logger.error(
-            "Earthquake validation failed during processing | "
-            "stream_id=%s | errors=%s",
+        retry_count = increment_retry_count(
+            client,
             message_id,
-            error.errors(),
         )
+
+        if retry_count is not None and retry_count >= MAX_RETRIES:
+            move_to_dead_letter_queue(
+                client,
+                message_id,
+                fields,
+                retry_count,
+            )
+
         return False
 
     except redis.RedisError as error:
@@ -113,6 +190,20 @@ def process_message(client, message_id, fields):
             message_id,
             error,
         )
+
+        retry_count = increment_retry_count(
+            client,
+            message_id,
+        )
+
+        if retry_count is not None and retry_count >= MAX_RETRIES:
+            move_to_dead_letter_queue(
+                client,
+                message_id,
+                fields,
+                retry_count,
+            )
+
         return False
 
 
