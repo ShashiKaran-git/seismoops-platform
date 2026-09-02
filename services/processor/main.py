@@ -4,6 +4,10 @@ import logging
 import redis
 from pydantic import ValidationError
 
+from services.database.postgres import (
+    create_postgres_connection,
+    save_earthquake_event,
+)
 from services.models import EarthquakeEvent
 
 
@@ -52,6 +56,7 @@ def create_redis_client():
         )
         return None
 
+
 def increment_retry_count(client, message_id):
     retry_key = f"{RETRY_KEY_PREFIX}{message_id}"
 
@@ -79,7 +84,9 @@ def increment_retry_count(client, message_id):
             message_id,
             error,
         )
+
         return None
+
 
 def move_to_dead_letter_queue(client, message_id, fields, retry_count):
     try:
@@ -119,9 +126,16 @@ def move_to_dead_letter_queue(client, message_id, fields, retry_count):
             message_id,
             error,
         )
+
         return False
 
-def process_message(client, message_id, fields):
+
+def process_message(
+    client,
+    postgres_connection,
+    message_id,
+    fields,
+):
     try:
         event_data = fields.get("event_data")
 
@@ -145,6 +159,15 @@ def process_message(client, message_id, fields):
             event.place,
         )
 
+        if not save_earthquake_event(
+            postgres_connection,
+            event,
+        ):
+            raise RuntimeError(
+                f"Failed to persist earthquake event | "
+                f"event_id={event.event_id}"
+            )
+
         client.xack(
             EARTHQUAKE_STREAM,
             CONSUMER_GROUP,
@@ -160,7 +183,13 @@ def process_message(client, message_id, fields):
 
         return True
 
-    except (json.JSONDecodeError, ValidationError, ValueError) as error:
+    except (
+        json.JSONDecodeError,
+        ValidationError,
+        ValueError,
+        RuntimeError,
+    ) as error:
+
         logger.error(
             "Message processing failed | "
             "stream_id=%s | error=%s",
@@ -207,7 +236,10 @@ def process_message(client, message_id, fields):
         return False
 
 
-def recover_pending_messages(client):
+def recover_pending_messages(
+    client,
+    postgres_connection,
+):
     try:
         result = client.xautoclaim(
             name=EARTHQUAKE_STREAM,
@@ -232,7 +264,12 @@ def recover_pending_messages(client):
                 message_id,
             )
 
-            if process_message(client, message_id, fields):
+            if process_message(
+                client,
+                postgres_connection,
+                message_id,
+                fields,
+            ):
                 recovered_count += 1
 
         logger.info(
@@ -247,10 +284,14 @@ def recover_pending_messages(client):
             "Failed to recover pending messages | error=%s",
             error,
         )
+
         return 0
 
 
-def consume_new_messages(client):
+def consume_new_messages(
+    client,
+    postgres_connection,
+):
     try:
         messages = client.xreadgroup(
             groupname=CONSUMER_GROUP,
@@ -270,7 +311,12 @@ def consume_new_messages(client):
         for stream_name, stream_messages in messages:
             for message_id, fields in stream_messages:
 
-                if process_message(client, message_id, fields):
+                if process_message(
+                    client,
+                    postgres_connection,
+                    message_id,
+                    fields,
+                ):
                     processed_count += 1
 
         return processed_count
@@ -280,6 +326,7 @@ def consume_new_messages(client):
             "Failed to consume earthquake stream | error=%s",
             error,
         )
+
         return 0
 
 
@@ -287,6 +334,15 @@ def main():
     redis_client = create_redis_client()
 
     if redis_client is None:
+        raise SystemExit(1)
+
+    postgres_connection = create_postgres_connection()
+
+    if postgres_connection is None:
+        logger.error(
+            "Unable to start processor without PostgreSQL"
+        )
+        redis_client.close()
         raise SystemExit(1)
 
     logger.info(
@@ -299,14 +355,23 @@ def main():
 
     try:
         while True:
-            recover_pending_messages(redis_client)
-            consume_new_messages(redis_client)
+            recover_pending_messages(
+                redis_client,
+                postgres_connection,
+            )
+
+            consume_new_messages(
+                redis_client,
+                postgres_connection,
+            )
 
     except KeyboardInterrupt:
         logger.info("Processor shutdown requested")
 
     finally:
+        postgres_connection.close()
         redis_client.close()
+
         logger.info("Processor stopped")
 
 
