@@ -25,24 +25,27 @@ flowchart TD
     D -->|new| E[Redis Stream<br/>seismoops:earthquake-stream]
     E --> F[Consumer Group<br/>seismoops-processors]
     F --> G[Processor<br/>seismoops-processor-1]
-    G --> H{Success?}
-    H -->|yes| I[XACK]
-    H -->|no| J[increment retry key<br/>seismoops:retry:msg_id]
-    J --> K{retry_count = 3?}
-    K -->|no| L[stays pending in PEL]
-    L -.->|XAUTOCLAIM, idle >= 30s| G
-    K -->|yes| M[XADD to seismoops:earthquake-dlq]
-    M --> N[XACK original message]
-    N --> O[delete retry key]
+    G --> H{Valid + Processable?}
+
+    H -->|yes| I[PostgreSQL<br/>earthquake_events]
+    I --> J[XACK]
+
+    H -->|no| K[increment retry key<br/>seismoops:retry:msg_id]
+    K --> L{retry_count = 3?}
+    L -->|no| M[stays pending in PEL]
+    M -.->|XAUTOCLAIM, idle >= 30s| G
+    L -->|yes| N[XADD to seismoops:earthquake-dlq]
+    N --> O[XACK original message]
+    O --> P[delete retry key]
 ```
 
-The main data path is USGS → Collector → validation → idempotency check → Redis Stream → Consumer Group → Processor → validation → acknowledgement. Running alongside it is the reliability path: a message that isn't acknowledged stays in the consumer group's Pending Entries List, gets reclaimed by `XAUTOCLAIM` once idle long enough, and is retried until it succeeds or exhausts its retry budget and is written to the dead-letter stream.
+The main data path is USGS → Collector → validation → idempotency check → Redis Stream → Consumer Group → Processor → validation → PostgreSQL → acknowledgement. Running alongside it is the reliability path: a message that isn't acknowledged stays in the consumer group's Pending Entries List, gets reclaimed by `XAUTOCLAIM` once idle long enough, and is retried until it succeeds or exhausts its retry budget and is written to the dead-letter stream.
 
 ## Why Redis Streams
 
-A Redis List or Pub/Sub channel doesn't provide the consumer-group delivery tracking this project needs — once an item is popped or published, there's no record of whether it was actually handled. Redis Streams provide two things this project depends on directly:
+A Redis List or a pub/sub channel gives you delivery, but not accountability — once an item is popped or published, there's no record of whether it was actually handled. Redis Streams provide two things this project depends on directly:
 
-- **Presistent, ordered entries.** Events are appended via `XADD` to `seismoops:earthquake-stream` and retained there regardless of consumption state — acknowledgement never deletes the entry.
+- **Persistent, ordered entries.** Events are appended via `XADD` to `seismoops:earthquake-stream` and retained there regardless of consumption state — acknowledgement never deletes the entry.
 - **Consumer-group delivery tracking.** The `seismoops-processors` group tracks, per consumer, which messages have been delivered but not yet acknowledged. That tracked state (the PEL) is what makes recovery, retries, and the DLQ possible at all.
 
 ## Event Processing Flow
@@ -83,6 +86,10 @@ seismoops-platform/
 │   ├── __init__.py
 │   ├── models.py                # shared EarthquakeEvent model — imported by collector and processor
 │   │
+│   ├── database/
+│   │   ├── __init__.py
+│   │   └── postgres.py          # PostgreSQL connection + earthquake persistence
+│   │
 │   ├── collector/
 │   │   ├── __init__.py
 │   │   ├── main.py              # fetch USGS feed, validate, publish (one-shot)
@@ -92,7 +99,7 @@ seismoops-platform/
 │   │
 │   └── processor/
 │       ├── __init__.py
-│       ├── main.py              # long-running consumer: recovery, consumption, retry, DLQ
+│       ├── main.py              # long-running consumer: recovery, consumption, retry, DLQ, persistence
 │       └── test_failure.py      # deliberately fails before XACK, to exercise recovery
 │
 ├── .gitignore
@@ -110,10 +117,12 @@ There is no `service/` (singular) directory in the current repository — only `
 - `requests`
 - Pydantic (`2.13.4`)
 - Redis `7.4.8`, Redis Streams, Redis Consumer Groups (`redis-py` `8.1.0`)
-- Docker (used to run Redis locally; the application code itself is not containerized)
+- PostgreSQL `15`
+- `psycopg2-binary`
+- Docker (used to run Redis and PostgreSQL locally; the application code itself is not containerized)
 - Git / GitHub
 
-**Planned, not implemented:** PostgreSQL persistence, an AI earthquake-intelligence service, Prometheus/Grafana observability, Kubernetes, CI/CD, Terraform, AWS deployment. None of these exist in the repository today.
+**Planned, not implemented:** an AI earthquake-intelligence service, Prometheus/Grafana observability, Kubernetes, CI/CD, Terraform, AWS deployment.
 
 ## Local Development
 
@@ -145,6 +154,32 @@ docker exec -it seismoops-redis redis-cli ping   # expect PONG
 ```
 
 Both services connect to `localhost:6379`, db `0`.
+
+### Start PostgreSQL
+
+Start the existing PostgreSQL container:
+
+```bash
+docker start seismoops-postgres
+```
+
+Verify that PostgreSQL is running:
+
+```bash
+docker ps
+```
+
+The PostgreSQL container should appear with port `5432` exposed. The database is expected to use:
+
+```
+Database: seismoops
+User: seismoops
+Password: seismoops_dev
+Host: localhost
+Port: 5432
+```
+
+There is no migration or setup script in the repository, so the `seismoops` database and the `earthquake_events` table it expects (matching the columns inserted by `services/database/postgres.py`) have to be created manually before running the processor for the first time.
 
 ### Run the collector
 
@@ -200,7 +235,9 @@ The following has been manually verified against a running local instance:
 - Retry counting: because the test event was invalid, processing failed on each attempt, and the retry counter was observed progressing `retry=1/3`, `retry=2/3`, `retry=3/3`
 - DLQ transfer: after the third failure, the event was written to `seismoops:earthquake-dlq`, and the original stream message was acknowledged, removing it from the PEL
 
-This is manual reliability testing, exercised through `services/processor/test_failure.py` and direct Redis inspection — there is no automated test suite in the repository. It confirms the recovery → retry → DLQ path works as implemented under a single processor instance; it does not establish behavior under concurrent processors, sustained load, or Redis restarts.
+**PostgreSQL persistence.** Verified manually by starting PostgreSQL, running the processor, then running the collector against the live USGS feed, and confirming the resulting events were written to `earthquake_events`. PostgreSQL was then restarted and the previously stored rows were confirmed still present. Temporary test data used during this check was removed afterward. Duplicate protection was also confirmed: re-inserting an existing `event_id` did not create a duplicate row or error, consistent with the `ON CONFLICT (event_id) DO NOTHING` clause in `services/database/postgres.py`.
+
+This is manual reliability testing, exercised through `services/processor/test_failure.py` and direct Redis/PostgreSQL inspection — there is no automated test suite in the repository. It confirms the recovery → retry → DLQ path and the persistence path work as implemented under a single processor instance; it does not establish behavior under concurrent processors, sustained load, or Redis/PostgreSQL restarts under load.
 
 ## Roadmap
 
@@ -222,9 +259,9 @@ This is manual reliability testing, exercised through `services/processor/test_f
 - [x] Bounded retry handling
 - [x] Dead-letter queue
 
-**Phase 4 — Persistence** (planned)
-- [ ] PostgreSQL integration
-- [ ] Historical earthquake storage
+**Phase 4 — Persistence** ✅
+- [x] PostgreSQL integration
+- [x] Historical earthquake storage
 - [ ] Query API
 
 **Phase 5 — AI Intelligence** (planned)
@@ -248,7 +285,7 @@ This is manual reliability testing, exercised through `services/processor/test_f
 
 - The collector is not scheduled — it's a one-shot script with no built-in polling loop or cron integration.
 - The collector processes only the first 5 features returned per run, a fixed cap in the current code.
-- No persistence beyond Redis — a successfully processed event isn't stored anywhere after acknowledgement.
+- PostgreSQL persistence is currently local-only, and the database and `earthquake_events` schema are created manually — there's no `.sql` file or migration tooling in the repository.
 - The DLQ has no consumer — failed events accumulate in `seismoops:earthquake-dlq` with nothing currently reading, alerting on, or replaying them.
 - Only Redis is containerized; the collector and processor run as local Python processes with hardcoded connection settings.
 - `CONSUMER_NAME = "seismoops-processor-1"` is hardcoded, so running two processor instances at once would have both claim the same consumer identity rather than scaling out independently.
