@@ -1,6 +1,7 @@
 import logging
 
 import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from services.models import EarthquakeEvent
 
@@ -89,3 +90,73 @@ def save_earthquake_event(connection, event: EarthquakeEvent):
         )
 
         return False
+
+def get_earthquake_events(connection, limit=100, offset=0):
+    try:
+        with connection.cursor(
+            cursor_factory=RealDictCursor
+        ) as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    event_id,
+                    magnitude,
+                    place,
+                    latitude,
+                    longitude,
+                    depth_km,
+                    timestamp,
+                    source,
+                    created_at
+                FROM earthquake_events
+                ORDER BY timestamp DESC
+                LIMIT %s
+                OFFSET %s
+                """,
+                (limit, offset),
+            )
+
+            return cursor.fetchall()
+
+    except psycopg2.Error as error:
+        logger.error(
+            "Failed to fetch earthquake events | error=%s",
+            error,
+        )
+
+        return []
+
+def get_earthquake_event_by_id(connection, event_id):
+    try:
+        with connection.cursor(
+            cursor_factory=RealDictCursor
+        ) as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    event_id,
+                    magnitude,
+                    place,
+                    latitude,
+                    longitude,
+                    depth_km,
+                    timestamp,
+                    source,
+                    created_at
+                FROM earthquake_events
+                WHERE event_id = %s
+                """,
+                (event_id,),
+            )
+
+            return cursor.fetchone()
+
+    except psycopg2.Error as error:
+        logger.error(
+            "Failed to fetch earthquake event | "
+            "event_id=%s | error=%s",
+            event_id,
+            error,
+        )
+
+        return None
