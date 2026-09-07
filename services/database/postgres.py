@@ -91,7 +91,13 @@ def save_earthquake_event(connection, event: EarthquakeEvent):
 
         return False
 
-def get_earthquake_events(connection, limit=100, offset=0):
+def get_earthquake_events(
+    connection,
+    limit=100,
+    offset=0,
+    min_magnitude=None,
+    place=None,
+):
     try:
         with connection.cursor(
             cursor_factory=RealDictCursor
@@ -106,14 +112,28 @@ def get_earthquake_events(connection, limit=100, offset=0):
                     longitude,
                     depth_km,
                     timestamp,
-                    source,
-                    created_at
+                    source
                 FROM earthquake_events
+                WHERE (
+                    %s IS NULL
+                    OR magnitude >= %s
+                )
+                AND (
+                    %s IS NULL
+                    OR place ILIKE %s
+                )
                 ORDER BY timestamp DESC
                 LIMIT %s
                 OFFSET %s
                 """,
-                (limit, offset),
+                (
+                    min_magnitude,
+                    min_magnitude,
+                    place,
+                    f"%{place}%" if place is not None else None,
+                    limit,
+                    offset,
+                ),
             )
 
             return cursor.fetchall()

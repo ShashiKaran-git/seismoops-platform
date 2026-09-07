@@ -37,6 +37,8 @@ def health_check():
 def get_earthquakes(
     limit: int = 100,
     offset: int = 0,
+    min_magnitude: float | None = None,
+    place: str | None = None,
 ):
     if limit < 1 or limit > 100:
         raise HTTPException(
@@ -63,6 +65,8 @@ def get_earthquakes(
             connection,
             limit=limit,
             offset=offset,
+            min_magnitude=min_magnitude,
+            place=place,
         )
 
         response = []
