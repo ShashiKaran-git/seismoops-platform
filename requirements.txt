@@ -12,3 +12,5 @@ urllib3==2.7.0
 psycopg2-binary==2.9.12
 fastapi
 uvicorn
+pytest==9.1.1
+httpx2
