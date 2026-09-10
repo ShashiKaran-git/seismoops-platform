@@ -1,3 +1,10 @@
+from services.models import EarthquakeEvent
+
+from services.observability.metrics import (
+    COLLECTOR_EVENTS_FETCHED,
+    COLLECTOR_EVENTS_PUBLISHED,
+)
+
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
@@ -5,6 +12,7 @@ import requests
 
 from services.collector.main import (
     fetch_earthquakes,
+    main,
     parse_earthquake,
 )
 def test_parse_earthquake_valid_feature():
@@ -156,3 +164,76 @@ def test_fetch_earthquakes_invalid_json(mock_get):
     result = fetch_earthquakes()
 
     assert result is None
+
+def test_fetch_earthquakes_increments_events_fetched_metric():
+    before = COLLECTOR_EVENTS_FETCHED._value.get()
+
+    mock_response = Mock()
+
+    mock_response.raise_for_status.return_value = None
+    mock_response.json.return_value = {
+        "features": [
+            {"id": "event-1"},
+            {"id": "event-2"},
+            {"id": "event-3"},
+        ]
+    }
+
+    with patch(
+        "services.collector.main.requests.get",
+        return_value=mock_response,
+    ):
+        result = fetch_earthquakes()
+
+    after = COLLECTOR_EVENTS_FETCHED._value.get()
+
+    assert result is not None
+    assert after - before == 3
+
+def test_main_increments_events_published_metric():
+    before = COLLECTOR_EVENTS_PUBLISHED._value.get()
+
+    event = EarthquakeEvent(
+        event_id="published-metric-test",
+        magnitude=2.5,
+        place="Published Metric Test",
+        latitude=10.0,
+        longitude=20.0,
+        depth_km=5.0,
+        timestamp=datetime(
+            2026,
+            9,
+            10,
+            10,
+            0,
+            tzinfo=timezone.utc,
+        ),
+    )
+
+    with patch(
+        "services.collector.main.fetch_earthquakes",
+        return_value={
+            "features": [
+                {
+                    "id": "published-metric-test",
+                    "properties": {},
+                    "geometry": {},
+                }
+            ]
+        },
+    ), patch(
+        "services.collector.main.create_redis_client",
+        return_value=Mock(),
+    ), patch(
+        "services.collector.main.parse_earthquake",
+        return_value=event,
+    ), patch(
+        "services.collector.main.publish_earthquake",
+        return_value=True,
+    ):
+
+        main()
+
+    after = COLLECTOR_EVENTS_PUBLISHED._value.get()
+
+    assert after - before == 1

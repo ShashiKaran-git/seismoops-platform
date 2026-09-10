@@ -5,9 +5,16 @@ import requests
 from pydantic import ValidationError
 
 from services.models import EarthquakeEvent
+
 from services.collector.redis_client import (
     create_redis_client,
     publish_earthquake,
+)
+
+from services.observability.metrics import (
+    COLLECTOR_ERRORS,
+    COLLECTOR_EVENTS_FETCHED,
+    COLLECTOR_EVENTS_PUBLISHED,
 )
 
 
@@ -21,6 +28,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,34 +36,63 @@ def fetch_earthquakes():
     logger.info("Fetching earthquake data from USGS")
 
     try:
-        response = requests.get(USGS_URL, timeout=10)
+        response = requests.get(
+            USGS_URL,
+            timeout=10,
+        )
+
         response.raise_for_status()
 
         data = response.json()
 
+        event_count = len(
+            data.get("features", [])
+        )
+
+        COLLECTOR_EVENTS_FETCHED.inc(
+            event_count
+        )
+
         logger.info(
             "Successfully fetched earthquake data | events=%d",
-            len(data.get("features", [])),
+            event_count,
         )
 
         return data
 
     except requests.exceptions.Timeout:
-        logger.error("USGS request timed out")
+        COLLECTOR_ERRORS.inc()
+
+        logger.error(
+            "USGS request timed out"
+        )
+
         return None
 
     except requests.exceptions.RequestException as error:
-        logger.error("USGS request failed | error=%s", error)
+        COLLECTOR_ERRORS.inc()
+
+        logger.error(
+            "USGS request failed | error=%s",
+            error,
+        )
+
         return None
 
     except ValueError:
-        logger.error("USGS returned invalid JSON")
+        COLLECTOR_ERRORS.inc()
+
+        logger.error(
+            "USGS returned invalid JSON"
+        )
+
         return None
 
 
 def parse_earthquake(feature):
     try:
         properties = feature["properties"]
+
         coordinates = feature["geometry"]["coordinates"]
 
         timestamp = datetime.fromtimestamp(
@@ -79,14 +116,21 @@ def parse_earthquake(feature):
             feature.get("id"),
             error.errors(),
         )
+
         return None
 
-    except (KeyError, TypeError, IndexError, ValueError) as error:
+    except (
+        KeyError,
+        TypeError,
+        IndexError,
+        ValueError,
+    ) as error:
         logger.warning(
             "Invalid earthquake data | event_id=%s | error=%s",
             feature.get("id"),
             error,
         )
+
         return None
 
 
@@ -94,13 +138,19 @@ def main():
     data = fetch_earthquakes()
 
     if data is None:
-        logger.error("Collector stopped because USGS data could not be fetched")
+        logger.error(
+            "Collector stopped because USGS data could not be fetched"
+        )
+
         raise SystemExit(1)
 
     redis_client = create_redis_client()
 
     if redis_client is None:
-        logger.error("Collector stopped because Redis is unavailable")
+        logger.error(
+            "Collector stopped because Redis is unavailable"
+        )
+
         raise SystemExit(1)
 
     published_count = 0
@@ -111,7 +161,12 @@ def main():
         if event is None:
             continue
 
-        if publish_earthquake(redis_client, event):
+        if publish_earthquake(
+            redis_client,
+            event,
+        ):
+            COLLECTOR_EVENTS_PUBLISHED.inc()
+
             published_count += 1
 
     logger.info(

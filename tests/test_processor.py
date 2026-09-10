@@ -1,6 +1,8 @@
 import json
 from unittest.mock import Mock, patch
-
+from services.observability.metrics import (
+    PROCESSOR_RETRIES,
+)
 from services.processor.main import (
     CONSUMER_GROUP,
     DEAD_LETTER_STREAM,
@@ -357,3 +359,18 @@ def test_consume_new_messages(redis_client):
     assert call_args[1] is postgres_connection
     assert call_args[2] == message_id
     assert call_args[3]["event_id"] == "consume-test"
+
+def test_increment_retry_count_increments_metric(redis_client):
+    before = PROCESSOR_RETRIES._value.get()
+
+    message_id = "metric-retry-test"
+
+    retry_count = increment_retry_count(
+        redis_client,
+        message_id,
+    )
+
+    after = PROCESSOR_RETRIES._value.get()
+
+    assert retry_count == 1
+    assert after - before == 1

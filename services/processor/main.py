@@ -9,6 +9,13 @@ from services.database.postgres import (
     save_earthquake_event,
 )
 from services.models import EarthquakeEvent
+from services.observability.metrics import (
+    PROCESSOR_DLQ_MESSAGES,
+    PROCESSOR_FAILURES,
+    PROCESSOR_MESSAGES_PROCESSED,
+    PROCESSOR_RECOVERED_MESSAGES,
+    PROCESSOR_RETRIES,
+)
 
 
 REDIS_HOST = "localhost"
@@ -68,6 +75,8 @@ def increment_retry_count(client, message_id):
             86_400,
         )
 
+        PROCESSOR_RETRIES.inc()
+
         logger.warning(
             "Incremented retry count | stream_id=%s | retry=%s/%s",
             message_id,
@@ -88,7 +97,12 @@ def increment_retry_count(client, message_id):
         return None
 
 
-def move_to_dead_letter_queue(client, message_id, fields, retry_count):
+def move_to_dead_letter_queue(
+    client,
+    message_id,
+    fields,
+    retry_count,
+):
     try:
         dlq_fields = dict(fields)
 
@@ -109,6 +123,8 @@ def move_to_dead_letter_queue(client, message_id, fields, retry_count):
         client.delete(
             f"{RETRY_KEY_PREFIX}{message_id}"
         )
+
+        PROCESSOR_DLQ_MESSAGES.inc()
 
         logger.error(
             "Moved earthquake event to dead-letter queue | "
@@ -174,6 +190,8 @@ def process_message(
             message_id,
         )
 
+        PROCESSOR_MESSAGES_PROCESSED.inc()
+
         logger.info(
             "Acknowledged earthquake event | "
             "stream_id=%s | event_id=%s",
@@ -189,6 +207,8 @@ def process_message(
         ValueError,
         RuntimeError,
     ) as error:
+
+        PROCESSOR_FAILURES.inc()
 
         logger.error(
             "Message processing failed | "
@@ -213,6 +233,9 @@ def process_message(
         return False
 
     except redis.RedisError as error:
+
+        PROCESSOR_FAILURES.inc()
+
         logger.error(
             "Redis error while processing message | "
             "stream_id=%s | error=%s",
@@ -258,6 +281,8 @@ def recover_pending_messages(
         recovered_count = 0
 
         for message_id, fields in messages:
+            PROCESSOR_RECOVERED_MESSAGES.inc()
+
             logger.info(
                 "Recovered pending earthquake event | "
                 "stream_id=%s",
