@@ -1,6 +1,11 @@
 import json
 from unittest.mock import Mock, patch
+
 from services.observability.metrics import (
+    PROCESSOR_DLQ_MESSAGES,
+    PROCESSOR_FAILURES,
+    PROCESSOR_MESSAGES_PROCESSED,
+    PROCESSOR_RECOVERED_MESSAGES,
     PROCESSOR_RETRIES,
 )
 from services.processor.main import (
@@ -14,6 +19,45 @@ from services.processor.main import (
     process_message,
     recover_pending_messages,
 )
+
+def test_process_message_increments_processed_metric():
+    before = PROCESSOR_MESSAGES_PROCESSED._value.get()
+
+    client = Mock()
+    postgres_connection = Mock()
+
+    event_data = json.dumps(
+        {
+            "event_id": "processed-metric-test",
+            "magnitude": 2.5,
+            "place": "Processed Metric Test",
+            "latitude": 10.0,
+            "longitude": 20.0,
+            "depth_km": 5.0,
+            "timestamp": "2026-09-10T10:00:00Z",
+            "source": "USGS",
+        }
+    )
+
+    with patch(
+        "services.processor.main.save_earthquake_event",
+        return_value=True,
+    ):
+        result = process_message(
+            client,
+            postgres_connection,
+            "1-0",
+            {
+                "event_id": "processed-metric-test",
+                "event_data": event_data,
+            },
+        )
+
+    after = PROCESSOR_MESSAGES_PROCESSED._value.get()
+
+    assert result is True
+    assert after - before == 1
+    client.xack.assert_called_once()
 
 
 def test_increment_retry_count(redis_client):
@@ -374,3 +418,150 @@ def test_increment_retry_count_increments_metric(redis_client):
 
     assert retry_count == 1
     assert after - before == 1
+
+def test_process_message_increments_failure_metric():
+    before = PROCESSOR_FAILURES._value.get()
+
+    client = Mock()
+    postgres_connection = Mock()
+
+    event_data = json.dumps(
+        {
+            "event_id": "failure-metric-test",
+            "magnitude": 2.5,
+            "place": "Failure Metric Test",
+            "latitude": 10.0,
+            "longitude": 20.0,
+            "depth_km": 5.0,
+            "timestamp": "2026-09-10T10:00:00Z",
+            "source": "USGS",
+        }
+    )
+
+    with patch(
+        "services.processor.main.save_earthquake_event",
+        return_value=False,
+    ), patch(
+        "services.processor.main.increment_retry_count",
+        return_value=1,
+    ):
+        result = process_message(
+            client,
+            postgres_connection,
+            "2-0",
+            {
+                "event_id": "failure-metric-test",
+                "event_data": event_data,
+            },
+        )
+
+    after = PROCESSOR_FAILURES._value.get()
+
+    assert result is False
+    assert after - before == 1
+    client.xack.assert_not_called()
+
+def test_process_message_increments_failure_metric():
+    before = PROCESSOR_FAILURES._value.get()
+
+    client = Mock()
+    postgres_connection = Mock()
+
+    event_data = json.dumps(
+        {
+            "event_id": "failure-metric-test",
+            "magnitude": 2.5,
+            "place": "Failure Metric Test",
+            "latitude": 10.0,
+            "longitude": 20.0,
+            "depth_km": 5.0,
+            "timestamp": "2026-09-10T10:00:00Z",
+            "source": "USGS",
+        }
+    )
+
+    with patch(
+        "services.processor.main.save_earthquake_event",
+        return_value=False,
+    ), patch(
+        "services.processor.main.increment_retry_count",
+        return_value=1,
+    ):
+        result = process_message(
+            client,
+            postgres_connection,
+            "2-0",
+            {
+                "event_id": "failure-metric-test",
+                "event_data": event_data,
+            },
+        )
+
+    after = PROCESSOR_FAILURES._value.get()
+
+    assert result is False
+    assert after - before == 1
+    client.xack.assert_not_called()
+
+def test_recover_pending_messages_increments_metric(redis_client):
+    before = PROCESSOR_RECOVERED_MESSAGES._value.get()
+
+    redis_client.xgroup_create(
+        name=EARTHQUAKE_STREAM,
+        groupname=CONSUMER_GROUP,
+        id="0-0",
+        mkstream=True,
+    )
+
+    message_id = redis_client.xadd(
+        EARTHQUAKE_STREAM,
+        {
+            "event_id": "metric-recovery-test",
+            "event_data": json.dumps(
+                {
+                    "event_id": "metric-recovery-test",
+                    "magnitude": 2.5,
+                    "place": "Recovery Metric Test",
+                    "latitude": 10.0,
+                    "longitude": 20.0,
+                    "depth_km": 5.0,
+                    "timestamp": "2026-09-10T10:00:00Z",
+                    "source": "USGS",
+                }
+            ),
+        },
+    )
+
+    messages = redis_client.xreadgroup(
+        groupname=CONSUMER_GROUP,
+        consumername="test-consumer",
+        streams={EARTHQUAKE_STREAM: ">"},
+        count=1,
+    )
+
+    assert messages
+    assert messages[0][1][0][0] == message_id
+
+    postgres_connection = Mock()
+
+    with patch(
+        "services.processor.main.CONSUMER_NAME",
+        "seismoops-processor-1",
+    ), patch(
+        "services.processor.main.RECOVERY_IDLE_TIME_MS",
+        0,
+    ), patch(
+        "services.processor.main.process_message",
+        return_value=True,
+    ):
+
+        recovered_count = recover_pending_messages(
+            redis_client,
+            postgres_connection,
+        )
+
+    after = PROCESSOR_RECOVERED_MESSAGES._value.get()
+
+    assert recovered_count == 1
+    assert after - before == 1
+
