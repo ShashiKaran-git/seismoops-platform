@@ -42,3 +42,9 @@ PROCESSOR_RECOVERED_MESSAGES = Counter(
     "seismoops_processor_recovered_messages_total",
     "Total number of pending earthquake messages recovered",
 )
+
+# API metrics
+API_REQUESTS = Counter(
+    "seismoops_api_requests_total",
+    "Total number of HTTP requests received by the API",
+)

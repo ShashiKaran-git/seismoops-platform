@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from services.api.main import app
-
+from services.observability.metrics import API_REQUESTS
 
 client = TestClient(app)
 
@@ -137,3 +137,29 @@ def test_get_earthquakes_invalid_offset():
     assert response.json() == {
         "detail": "offset must be 0 or greater"
     }
+
+def test_api_request_increments_metric():
+    before = API_REQUESTS._value.get()
+
+    response = client.get("/health")
+
+    after = API_REQUESTS._value.get()
+
+    assert response.status_code == 200
+    assert after - before == 1
+
+def test_metrics_endpoint_exposes_custom_metrics():
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+
+    metrics = response.text
+
+    assert "seismoops_api_requests_total" in metrics
+    assert "seismoops_collector_events_fetched_total" in metrics
+    assert "seismoops_collector_events_published_total" in metrics
+    assert "seismoops_processor_messages_processed_total" in metrics
+    assert "seismoops_processor_failures_total" in metrics
+    assert "seismoops_processor_retries_total" in metrics
+    assert "seismoops_processor_dlq_messages_total" in metrics
+    assert "seismoops_processor_recovered_messages_total" in metrics

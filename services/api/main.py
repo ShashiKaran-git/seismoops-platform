@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
 from services.database.postgres import (
@@ -6,6 +8,7 @@ from services.database.postgres import (
     get_earthquake_events,
     get_earthquake_event_by_id,
 )
+from services.observability.metrics import API_REQUESTS
 
 
 app = FastAPI(
@@ -13,6 +16,18 @@ app = FastAPI(
     description="API for querying persisted earthquake events.",
     version="1.0.0",
 )
+
+
+@app.middleware("http")
+async def record_api_request(
+    request: Request,
+    call_next,
+):
+    API_REQUESTS.inc()
+
+    response = await call_next(request)
+
+    return response
 
 
 class EarthquakeResponse(BaseModel):
@@ -31,6 +46,14 @@ def health_check():
     return {
         "status": "ok"
     }
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
 
 
 @app.get("/earthquakes")
@@ -89,6 +112,7 @@ def get_earthquakes(
 
     finally:
         connection.close()
+
 
 @app.get("/earthquakes/{event_id}")
 def get_earthquake(event_id: str):
