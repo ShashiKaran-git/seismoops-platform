@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: "seismoops-api"
+    static_configs:
+      - targets:
+          - "host.docker.internal:8000"
+
+  - job_name: "seismoops-processor"
+    static_configs:
+      - targets:
+          - "host.docker.internal:8001"

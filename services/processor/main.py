@@ -2,6 +2,7 @@ import json
 import logging
 
 import redis
+from prometheus_client import start_http_server
 from pydantic import ValidationError
 
 from services.database.postgres import (
@@ -63,6 +64,54 @@ def create_redis_client():
         )
         return None
 
+def ensure_consumer_group(client):
+    try:
+        client.xgroup_create(
+            name=EARTHQUAKE_STREAM,
+            groupname=CONSUMER_GROUP,
+            id="0-0",
+            mkstream=True,
+        )
+
+        logger.info(
+            "Created Redis consumer group | "
+            "stream=%s | group=%s",
+            EARTHQUAKE_STREAM,
+            CONSUMER_GROUP,
+        )
+
+        return True
+
+    except redis.ResponseError as error:
+        if "BUSYGROUP" in str(error):
+            logger.info(
+                "Redis consumer group already exists | "
+                "stream=%s | group=%s",
+                EARTHQUAKE_STREAM,
+                CONSUMER_GROUP,
+            )
+            return True
+
+        logger.error(
+            "Failed to create Redis consumer group | "
+            "stream=%s | group=%s | error=%s",
+            EARTHQUAKE_STREAM,
+            CONSUMER_GROUP,
+            error,
+        )
+
+        return False
+
+    except redis.RedisError as error:
+        logger.error(
+            "Redis error while creating consumer group | "
+            "stream=%s | group=%s | error=%s",
+            EARTHQUAKE_STREAM,
+            CONSUMER_GROUP,
+            error,
+        )
+
+        return False
 
 def increment_retry_count(client, message_id):
     retry_key = f"{RETRY_KEY_PREFIX}{message_id}"
@@ -360,6 +409,13 @@ def main():
 
     if redis_client is None:
         raise SystemExit(1)
+
+    if not ensure_consumer_group(redis_client):
+        redis_client.close()
+        raise SystemExit(1)
+
+    start_http_server(8001)
+    logger.info("Processor metrics server started | port=8001")
 
     postgres_connection = create_postgres_connection()
 
